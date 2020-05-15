@@ -79,7 +79,7 @@ var TiDBLayerOptimizationBatch = TransformationRuleBatch{
 		NewRuleEliminateOuterJoinBelowAggregation(),
 		NewRuleTransformAggregateCaseToSelection(),
 		NewRuleTransformAggToProj(),
-		NewRuleEagerCount(),
+		NewRuleLeftEagerCount(),
 	},
 	memo.OperandLimit: {
 		NewRuleTransformLimitToTopN(),
@@ -2126,14 +2126,14 @@ func (r *TransformAggToProj) OnTransform(old *memo.ExprIter) (newExprs []*memo.G
 	return nil, false, false, nil
 }
 
-// EagerCount 将一个计数 agg 下推到 join 之下
-type EagerCount struct {
+// LeftEagerCount 将一个计数 agg 下推到 join 之下
+type LeftEagerCount struct {
 	baseRule
 }
 
 // The pattern of this rule is `Agg -> Join`.
-func NewRuleEagerCount() Transformation {
-	rule := &EagerCount{}
+func NewRuleLeftEagerCount() Transformation {
+	rule := &LeftEagerCount{}
 	rule.pattern = memo.BuildPattern(
 		memo.OperandAggregation,
 		memo.EngineTiDBOnly,
@@ -2143,27 +2143,76 @@ func NewRuleEagerCount() Transformation {
 }
 
 // Match implements Transformation interface.
-func (r *EagerCount) Match(expr *memo.ExprIter) bool {
+func (r *LeftEagerCount) Match(expr *memo.ExprIter) bool {
 	agg := expr.GetExpr().ExprNode.(*plannercore.LogicalAggregation)
 
 	if !agg.IsCompleteModeAgg() {
 		return false
 	}
 
-	// 要求 F 是 class C/D，并且在 Rd 被 Cd 筛选之后有 NGAd 函数决定 GAd+
+	// check class C: sum or count
+	for _, fun := range agg.AggFuncs {
+		switch fun.Name {
+			case ast.AggFuncSum, ast.AggFuncCount: return !fun.HasDistinct
+			default: return false
+		}
+	}
+
+	join := expr.Children[0].GetExpr().ExprNode.(*plannercore.LogicalJoin)
+	switch join.JoinType {
+		case plannercore.InnerJoin, plannercore.LeftOuterJoin, plannercore.RightOuterJoin:
+		default: return false
+	}
+
+	return true
+	// class C 有哪些呢：sum, count 没了
+
+	// 要求 F 是 class C，并且在 Rd 被 Cd 筛选之后有 NGAd 函数决定 GAd+
 	// NGAd：Rd 的小分组列
-	// GAd+：GAd ∪ d 在 C0 中出现的列的并集
+	// GAd+：GAd ∪ Rd 在 C0 中出现的列的并集
 	// GAd：Rd 中的分组列，不能为空
 	// 推荐拿 GAd+ 作为 NGAd 
+}
 
-	return false
+// 向左边下推一个 EagerCountAgg
+func (r *LeftEagerCount) solve(oldTopAgg *plannercore.LogicalAggregation, oldJoin *plannercore.LogicalJoin) (
+		newTopAgg, eagerCountAgg *plannercore.LogicalAggregation, newJoin *plannercore.LogicalJoin, succees bool) {
+
+	newTopAgg = &plannercore.LogicalAggregation{}
+	eagerCountAgg = &plannercore.LogicalAggregation{}
+	newJoin = &plannercore.LogicalJoin{}
+	return newTopAgg, eagerCountAgg, newJoin, false
 }
 
 // OnTransform implements Transformation interface.
-// This rule tries to convert agg to proj.
-func (r *EagerCount) OnTransform(old *memo.ExprIter) (newExprs []*memo.GroupExpr, eraseOld bool, eraseAll bool, err error) {
-	agg := old.GetExpr().ExprNode.(*plannercore.LogicalAggregation)
-	_ = agg
+// 这个规则，把 agg 下推！
+func (r *LeftEagerCount) OnTransform(old *memo.ExprIter) (newExprs []*memo.GroupExpr, eraseOld bool, eraseAll bool, err error) {
+	oldTopAggExpr := old.GetExpr()
+	oldJoinExpr := old.Children[0].GetExpr()
+
+	oldTopAggNode := oldTopAggExpr.ExprNode.(*plannercore.LogicalAggregation)
+	oldJoinNode := oldJoinExpr.ExprNode.(*plannercore.LogicalJoin)
+
+	newTopAggNode, eagerCountAggNode, newJoinNode, succees := r.solve(oldTopAggNode, oldJoinNode)
+
+	if !succees {
+		return nil, false, false, nil
+	}
+
+	newTopAggExpr := memo.NewGroupExpr(newTopAggNode)
+	eagerCountAggExpr := memo.NewGroupExpr(eagerCountAggNode)
+	newJoinExpr := memo.NewGroupExpr(newJoinNode)
+
+	if oldTopAggExpr.Group.Insert(newTopAggExpr) {
+		eagerCountAggGroup := memo.NewGroupWithSchema(eagerCountAggExpr, nil)
+		newJoinGroup := memo.NewGroupWithSchema(newJoinExpr, nil)
+
+		newTopAggExpr.SetChildren(newJoinGroup)
+		newJoinExpr.SetChildren(eagerCountAggGroup, oldJoinExpr.Children[1])
+		eagerCountAggExpr.SetChildren(oldJoinExpr.Children[0])
+
+		return []*memo.GroupExpr{newTopAggExpr}, false, false ,nil
+	}
 
 	return nil, false, false, nil
 }
