@@ -2178,10 +2178,32 @@ func (r *LeftEagerCount) Match(expr *memo.ExprIter) bool {
 func (r *LeftEagerCount) solve(oldTopAgg *plannercore.LogicalAggregation, oldJoin *plannercore.LogicalJoin) (
 		newTopAgg, eagerCountAgg *plannercore.LogicalAggregation, newJoin *plannercore.LogicalJoin, succees bool) {
 
-	newTopAgg = &plannercore.LogicalAggregation{}
-	eagerCountAgg = &plannercore.LogicalAggregation{}
-	newJoin = &plannercore.LogicalJoin{}
-	return newTopAgg, eagerCountAgg, newJoin, false
+	newTopAgg = plannercore.LogicalAggregation{
+		AggFuncs: oldTopAgg.AggFuncs,
+		GroupByItems: oldTopAgg.GroupByItems,
+	}.Init(oldTopAgg.SCtx(), oldTopAgg.SelectBlockOffset())
+
+	countStar, _ := aggregation.NewAggFuncDesc(oldTopAgg.SCtx(), "count", nil, false)
+
+	eagerCountAgg = plannercore.LogicalAggregation{
+		AggFuncs: []*aggregation.AggFuncDesc{countStar},
+		GroupByItems: oldTopAgg.GroupByItems,
+	}.Init(oldTopAgg.SCtx(), oldTopAgg.SelectBlockOffset())
+
+	newJoin = plannercore.LogicalJoin{}.Init(oldJoin.SCtx(), oldJoin.SelectBlockOffset())
+
+	/*
+	需要加一个 LogicalProjection，表示乘法
+	newTopAgg
+
+	*/
+
+	// newTopAgg 做完之后，在上面加一个 project 表示乘法
+	// newJoin 只要把 oldJoin 里面的所有的 left 端的表达式改成 eagerCount
+	// eagerCountAgg 的聚合函数是 count(*)，聚合 key 是 oldTopAgg 里面这个表的聚合 key，
+	// 以及 oldJoin 里面这张表涉及到的列
+
+	return newTopAgg, eagerCountAgg, newJoin, true
 }
 
 // OnTransform implements Transformation interface.
