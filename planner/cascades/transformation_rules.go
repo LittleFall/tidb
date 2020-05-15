@@ -79,6 +79,7 @@ var TiDBLayerOptimizationBatch = TransformationRuleBatch{
 		NewRuleEliminateOuterJoinBelowAggregation(),
 		NewRuleTransformAggregateCaseToSelection(),
 		NewRuleTransformAggToProj(),
+		NewRuleEagerCount(),
 	},
 	memo.OperandLimit: {
 		NewRuleTransformLimitToTopN(),
@@ -2124,6 +2125,50 @@ func (r *TransformAggToProj) OnTransform(old *memo.ExprIter) (newExprs []*memo.G
 
 	return nil, false, false, nil
 }
+
+// EagerCount 将一个计数 agg 下推到 join 之下
+type EagerCount struct {
+	baseRule
+}
+
+// The pattern of this rule is `Agg -> Join`.
+func NewRuleEagerCount() Transformation {
+	rule := &EagerCount{}
+	rule.pattern = memo.BuildPattern(
+		memo.OperandAggregation,
+		memo.EngineTiDBOnly,
+		memo.NewPattern(memo.OperandJoin, memo.EngineTiDBOnly),
+	)
+	return rule
+}
+
+// Match implements Transformation interface.
+func (r *EagerCount) Match(expr *memo.ExprIter) bool {
+	agg := expr.GetExpr().ExprNode.(*plannercore.LogicalAggregation)
+
+	if !agg.IsCompleteModeAgg() {
+		return false
+	}
+
+	// 要求 F 是 class C/D，并且在 Rd 被 Cd 筛选之后有 NGAd 函数决定 GAd+
+	// NGAd：Rd 的小分组列
+	// GAd+：GAd ∪ d 在 C0 中出现的列的并集
+	// GAd：Rd 中的分组列，不能为空
+	// 推荐拿 GAd+ 作为 NGAd 
+
+	return false
+}
+
+// OnTransform implements Transformation interface.
+// This rule tries to convert agg to proj.
+func (r *EagerCount) OnTransform(old *memo.ExprIter) (newExprs []*memo.GroupExpr, eraseOld bool, eraseAll bool, err error) {
+	agg := old.GetExpr().ExprNode.(*plannercore.LogicalAggregation)
+	_ = agg
+
+	return nil, false, false, nil
+}
+
+
 
 // InjectProjectionBelowTopN injects two Projections below and upon TopN if TopN's ByItems
 // contain ScalarFunctions.
