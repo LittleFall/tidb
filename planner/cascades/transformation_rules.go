@@ -2153,15 +2153,18 @@ func (r *LeftEagerCount) Match(expr *memo.ExprIter) bool {
 	// check class C: sum or count
 	for _, fun := range agg.AggFuncs {
 		switch fun.Name {
-			case ast.AggFuncSum, ast.AggFuncCount: return !fun.HasDistinct
-			default: return false
+		case ast.AggFuncSum, ast.AggFuncCount:
+			return !fun.HasDistinct
+		default:
+			return false
 		}
 	}
 
 	join := expr.Children[0].GetExpr().ExprNode.(*plannercore.LogicalJoin)
 	switch join.JoinType {
-		case plannercore.InnerJoin, plannercore.LeftOuterJoin, plannercore.RightOuterJoin:
-		default: return false
+	case plannercore.InnerJoin, plannercore.LeftOuterJoin, plannercore.RightOuterJoin:
+	default:
+		return false
 	}
 
 	return true
@@ -2171,40 +2174,10 @@ func (r *LeftEagerCount) Match(expr *memo.ExprIter) bool {
 	// NGAd：Rd 的小分组列
 	// GAd+：GAd ∪ Rd 在 C0 中出现的列的并集
 	// GAd：Rd 中的分组列，不能为空
-	// 推荐拿 GAd+ 作为 NGAd 
+	// 推荐拿 GAd+ 作为 NGAd
 }
 
 // 向左边下推一个 EagerCountAgg
-func (r *LeftEagerCount) solve(oldTopAgg *plannercore.LogicalAggregation, oldJoin *plannercore.LogicalJoin) (
-		newTopAgg, eagerCountAgg *plannercore.LogicalAggregation, newJoin *plannercore.LogicalJoin, succees bool) {
-
-	newTopAgg = plannercore.LogicalAggregation{
-		AggFuncs: oldTopAgg.AggFuncs,
-		GroupByItems: oldTopAgg.GroupByItems,
-	}.Init(oldTopAgg.SCtx(), oldTopAgg.SelectBlockOffset())
-
-	countStar, _ := aggregation.NewAggFuncDesc(oldTopAgg.SCtx(), "count", nil, false)
-
-	eagerCountAgg = plannercore.LogicalAggregation{
-		AggFuncs: []*aggregation.AggFuncDesc{countStar},
-		GroupByItems: oldTopAgg.GroupByItems,
-	}.Init(oldTopAgg.SCtx(), oldTopAgg.SelectBlockOffset())
-
-	newJoin = plannercore.LogicalJoin{}.Init(oldJoin.SCtx(), oldJoin.SelectBlockOffset())
-
-	/*
-	需要加一个 LogicalProjection，表示乘法
-	newTopAgg
-
-	*/
-
-	// newTopAgg 做完之后，在上面加一个 project 表示乘法
-	// newJoin 只要把 oldJoin 里面的所有的 left 端的表达式改成 eagerCount
-	// eagerCountAgg 的聚合函数是 count(*)，聚合 key 是 oldTopAgg 里面这个表的聚合 key，
-	// 以及 oldJoin 里面这张表涉及到的列
-
-	return newTopAgg, eagerCountAgg, newJoin, true
-}
 
 // OnTransform implements Transformation interface.
 // 这个规则，把 agg 下推！
@@ -2215,31 +2188,129 @@ func (r *LeftEagerCount) OnTransform(old *memo.ExprIter) (newExprs []*memo.Group
 	oldTopAggNode := oldTopAggExpr.ExprNode.(*plannercore.LogicalAggregation)
 	oldJoinNode := oldJoinExpr.ExprNode.(*plannercore.LogicalJoin)
 
-	newTopAggNode, eagerCountAggNode, newJoinNode, succees := r.solve(oldTopAggNode, oldJoinNode)
+	sctx := oldTopAggNode.SCtx()
 
-	if !succees {
-		return nil, false, false, nil
+	/*
+		先做 EagerCountAgg
+		GroupByItems: 左表在聚合中涉及到的列，左表在连接中涉及到的列
+		AggFuncs: count(1)，还有 GroupByItems 的 firstRow
+		Schema: AggFuncs 的计算结果，也就是】
+	*/
+
+	// collectGbyCols 获得 aggNode 的 GroupByCols() 以及 joinNode 的各个条件所包含的列中，
+	// 满足 schema.Contains() 的那些列。 需要给返回结果去重。
+	// 与 plannercore.aggregationPushDownSolver.collectGbyCols 实现思路基本相同。
+	// TODO：实现它
+	var collectGbyCols func(
+		aggNode *plannercore.LogicalAggregation,
+		joinNode *plannercore.LogicalJoin,
+		schema *expression.Schema,
+	) []*expression.Column
+
+	eagerCountAggGbyCols := collectGbyCols(oldTopAggNode, oldJoinNode, oldJoinExpr.Children[0].Prop.Schema)
+
+	var eagerCountAggFuncs []*aggregation.AggFuncDesc
+	countStar, err := aggregation.NewAggFuncDesc(sctx, ast.AggFuncCount, []expression.Expression{expression.NewOne()}, false)
+	if err != nil {
+		return nil, false, false, err
+	}
+	eagerCountAggFuncs = append(eagerCountAggFuncs, countStar)
+	for _, gbyCol := range eagerCountAggGbyCols {
+		aggFunc, err := aggregation.NewAggFuncDesc(sctx, ast.AggFuncFirstRow, []expression.Expression{gbyCol}, false)
+		if err != nil {
+			return nil, false, false, err
+		}
+		eagerCountAggFuncs = append(eagerCountAggFuncs, aggFunc)
 	}
 
-	newTopAggExpr := memo.NewGroupExpr(newTopAggNode)
+	// TODO: 预先指定 cap 以减少动态内存分配
+	eagerCountSchema := expression.NewSchema()
+
+	// 把 count* 的结果先放进去
+	countStarColumn := &expression.Column{
+		UniqueID: sctx.GetSessionVars().AllocPlanColumnID(),
+		RetType:  eagerCountAggFuncs[0].RetTp,
+	}
+
+	eagerCountSchema.Append(countStarColumn)
+
+	// 然后其它列只被 firstRow 了一下，直接放 clone.
+	for _, gbyCol := range eagerCountAggGbyCols {
+		eagerCountSchema.Append(gbyCol.Clone().(*expression.Column))
+	}
+
+	eagerCountAggNode := plannercore.LogicalAggregation{
+		AggFuncs:     eagerCountAggFuncs,
+		GroupByItems: expression.Column2Exprs(eagerCountAggGbyCols),
+	}.Init(sctx, oldTopAggNode.SelectBlockOffset())
+
 	eagerCountAggExpr := memo.NewGroupExpr(eagerCountAggNode)
+	eagerCountAggGroup := memo.NewGroupWithSchema(eagerCountAggExpr, eagerCountSchema)
+	eagerCountAggExpr.SetChildren(oldJoinExpr.Children[0])
+
+
+
+	/*
+		然后做 NewJoin
+		Conditions: 都和原来一样
+		Schema: 只需要把 countStar 那一列传上来.
+	*/
+	newJoinSchema := expression.NewSchema()
+	newJoinSchema.Append(countStarColumn.Clone().(*expression.Column))
+	newJoinSchema = expression.MergeSchema(newJoinSchema, oldJoinExpr.Group.Prop.Schema)
+
+	newJoinNode := oldJoinNode.Shallow()
 	newJoinExpr := memo.NewGroupExpr(newJoinNode)
+	newJoinGroup := memo.NewGroupWithSchema(newJoinExpr, newJoinSchema)
+	newJoinExpr.SetChildren(eagerCountAggGroup, oldJoinExpr.Children[1])
 
-	if oldTopAggExpr.Group.Insert(newTopAggExpr) {
-		eagerCountAggGroup := memo.NewGroupWithSchema(eagerCountAggExpr, nil)
-		newJoinGroup := memo.NewGroupWithSchema(newJoinExpr, nil)
+	/*
+		然后是 newTopAgg
+		AggFuncs 需要给 countStar 加一个 firstRow，把它传上去
+		schema 也需要加一个 firstRow，把它传上去
+	*/
 
-		newTopAggExpr.SetChildren(newJoinGroup)
-		newJoinExpr.SetChildren(eagerCountAggGroup, oldJoinExpr.Children[1])
-		eagerCountAggExpr.SetChildren(oldJoinExpr.Children[0])
-
-		return []*memo.GroupExpr{newTopAggExpr}, false, false ,nil
+	newTopAggFuncs := make([]*aggregation.AggFuncDesc, 0, len(oldTopAggNode.AggFuncs)+1)
+	for _, aggFuncs := range oldTopAggNode.AggFuncs {
+		newTopAggFuncs = append(newTopAggFuncs, aggFuncs.Clone())
+	}
+	firstRow, err := aggregation.NewAggFuncDesc(sctx, ast.AggFuncFirstRow, []expression.Expression{countStarColumn.Clone()}, false)
+	if err != nil {
+		return nil, false, false, err
+	}
+	newTopAggFuncs = append(newTopAggFuncs, firstRow)
+	newTopAggGbyItems := make([]expression.Expression, 0, len(oldTopAggNode.GroupByItems))
+	for _, gbyItem := range oldTopAggNode.GroupByItems {
+		newTopAggGbyItems = append(newTopAggGbyItems, gbyItem.Clone())
 	}
 
-	return nil, false, false, nil
+	newTopAggSchema := oldTopAggExpr.Group.Prop.Schema.Clone()
+	newTopAggSchema.Append(countStarColumn.Clone().(*expression.Column))
+
+	newTopAggNode :=  plannercore.LogicalAggregation{
+		AggFuncs:     newTopAggFuncs,
+		GroupByItems: newTopAggGbyItems,
+	}.Init(sctx, oldTopAggNode.SelectBlockOffset())
+	newTopAggExpr := memo.NewGroupExpr(newTopAggNode)
+	newTopAggGroup := memo.NewGroupWithSchema(newTopAggExpr, newTopAggSchema)
+	newTopAggExpr.SetChildren(newJoinGroup)
+
+	_ = newTopAggGroup
+	/*
+	最后需要加一个 logicalprojection 表示乘法
+	Exprs 只有一个 expression，就是将 newTopAgg 导出的内容乘一下.
+	是否有快速构建乘法的方式？
+	ScalarFunction(builtinArithmeticMultiplyDecimalSig)
+		Column
+		ScalarFunction(builtinCastIntAsDecimalSig)
+	*/
+
+	// if oldTopAggExpr.Group.Insert(newTopAggExpr) {
+	// 	return []*memo.GroupExpr{newTopAggExpr}, false, false, err
+	// }
+
+	return nil, false, false, err
 }
-
-
 
 // InjectProjectionBelowTopN injects two Projections below and upon TopN if TopN's ByItems
 // contain ScalarFunctions.
