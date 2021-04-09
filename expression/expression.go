@@ -1042,6 +1042,7 @@ func canFuncBePushed(sf *ScalarFunction, storeType kv.StoreType) bool {
 		ast.TimestampDiff,
 		ast.DateDiff,
 		ast.DateAdd,
+		ast.DateSub,
 		ast.FromUnixTime,
 		ast.UnixTimestamp,
 		ast.Extract,
@@ -1207,7 +1208,7 @@ func CanExprsPushDown(sc *stmtctx.StatementContext, exprs []Expression, client k
 
 func scalarExprSupportedByTiKV(function *ScalarFunction) bool {
 	switch function.FuncName.L {
-	case ast.Substr, ast.Substring, ast.DateAdd, ast.TimestampDiff, ast.DateDiff, ast.UnixTimestamp,
+	case ast.Substr, ast.Substring, ast.DateAdd, ast.DateSub, ast.TimestampDiff, ast.DateDiff, ast.UnixTimestamp,
 		ast.FromUnixTime, ast.Extract:
 		return false
 	default:
@@ -1217,7 +1218,7 @@ func scalarExprSupportedByTiKV(function *ScalarFunction) bool {
 
 func scalarExprSupportedByTiDB(function *ScalarFunction) bool {
 	switch function.FuncName.L {
-	case ast.Substr, ast.Substring, ast.DateAdd, ast.TimestampDiff, ast.DateDiff, ast.UnixTimestamp,
+	case ast.Substr, ast.Substring, ast.DateAdd, ast.DateSub, ast.TimestampDiff, ast.DateDiff, ast.UnixTimestamp,
 		ast.FromUnixTime:
 		return false
 	default:
@@ -1240,9 +1241,9 @@ func scalarExprSupportedByFlash(function *ScalarFunction) bool {
 		return true
 	case ast.Cast:
 		switch function.Function.PbCode() {
-		case tipb.ScalarFuncSig_CastIntAsInt, tipb.ScalarFuncSig_CastIntAsDecimal, tipb.ScalarFuncSig_CastIntAsString, tipb.ScalarFuncSig_CastIntAsTime,
+		case tipb.ScalarFuncSig_CastIntAsInt, tipb.ScalarFuncSig_CastIntAsReal, tipb.ScalarFuncSig_CastIntAsDecimal, tipb.ScalarFuncSig_CastIntAsString, tipb.ScalarFuncSig_CastIntAsTime,
 			tipb.ScalarFuncSig_CastRealAsInt, tipb.ScalarFuncSig_CastRealAsDecimal, tipb.ScalarFuncSig_CastRealAsString, tipb.ScalarFuncSig_CastRealAsTime,
-			tipb.ScalarFuncSig_CastStringAsInt, tipb.ScalarFuncSig_CastStringAsDecimal, tipb.ScalarFuncSig_CastStringAsString, tipb.ScalarFuncSig_CastStringAsTime,
+			tipb.ScalarFuncSig_CastStringAsInt, tipb.ScalarFuncSig_CastStringAsReal, tipb.ScalarFuncSig_CastStringAsDecimal, tipb.ScalarFuncSig_CastStringAsString, tipb.ScalarFuncSig_CastStringAsTime,
 			tipb.ScalarFuncSig_CastDecimalAsInt, tipb.ScalarFuncSig_CastDecimalAsDecimal, tipb.ScalarFuncSig_CastDecimalAsTime,
 			tipb.ScalarFuncSig_CastTimeAsInt, tipb.ScalarFuncSig_CastTimeAsDecimal, tipb.ScalarFuncSig_CastTimeAsTime, tipb.ScalarFuncSig_CastTimeAsString:
 			return true
@@ -1252,6 +1253,13 @@ func scalarExprSupportedByFlash(function *ScalarFunction) bool {
 	case ast.DateAdd:
 		switch function.Function.PbCode() {
 		case tipb.ScalarFuncSig_AddDateDatetimeInt, tipb.ScalarFuncSig_AddDateStringInt:
+			return true
+		default:
+			return false
+		}
+	case ast.DateSub:
+		switch function.Function.PbCode() {
+		case tipb.ScalarFuncSig_SubDateDatetimeInt, tipb.ScalarFuncSig_SubDateStringInt:
 			return true
 		default:
 			return false
